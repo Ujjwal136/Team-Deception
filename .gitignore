@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.venv313/
+*.db
+*.db-wal
+*.db-shm
+.env
+.pytest_cache/
+firewall/aegis_redactor/
+firewall/aegis_layer_b/
+sentinel_b_model.joblib
+private_key.wc
+*.mp4
+*.zip

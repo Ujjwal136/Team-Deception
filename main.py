@@ -1,0 +1,319 @@
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from agents import llm_agent, banking_db, managing_agent as ma
+from agents.managing_agent import QueryResult
+from config import settings
+from firewall.audit_chain import AuditChain
+from firewall.interceptor import Interceptor
+from firewall.redactor import Redactor
+from firewall.sentinel import Sentinel
+from models.schemas import (
+    AgentLinkRequest,
+    AgentLinkResponse,
+    ChatRequest,
+    ChatResponse,
+    FirewallEgressRequest,
+    FirewallEgressResponse,
+    FirewallIngressRequest,
+    FirewallIngressResponse,
+    HealthResponse,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("aegis")
+
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIR = BASE_DIR / "frontend"
+
+sentinel = Sentinel()
+redactor = Redactor()
+audit_chain = AuditChain()
+interceptor = Interceptor(sentinel, redactor, audit_chain)
+
+sentinel_loaded = sentinel.load()
+redactor_loaded = redactor.load()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ──
+    logger.info("Aegis Firewall starting...")
+
+    try:
+        layer_a = sentinel.layer_a_loaded
+        logger.info("Sentinel Layer A (SGD) - %s", "LOADED" if layer_a else "NOT AVAILABLE (fallback mode)")
+    except Exception:
+        logger.exception("Sentinel Layer A status check failed")
+
+    try:
+        layer_b = sentinel.layer_b_loaded
+        logger.info("Sentinel Layer B (DistilBERT) - %s", "LOADED" if layer_b else "NOT AVAILABLE (fallback mode)")
+    except Exception:
+        logger.exception("Sentinel Layer B status check failed")
+
+    try:
+        has_ner = redactor.ner_model is not None
+        logger.info("Redactor NER (DistilBERT) - %s", "LOADED" if has_ner else "NOT AVAILABLE (fallback mode)")
+    except Exception:
+        logger.exception("Redactor NER status check failed")
+
+    logger.info("Redactor Regex - LOADED")
+
+    try:
+        from firewall.fpe_engine import _get_numeric_cipher
+
+        _get_numeric_cipher()
+        logger.info("FPE Engine - LOADED")
+    except Exception:
+        logger.exception("FPE Engine failed to initialize")
+
+    try:
+        _ = audit_chain.stats()
+        ac = audit_chain.connectivity()
+        logger.info("Audit Chain - %s (%s)", ac["status"].upper(), ac["backend"])
+    except Exception:
+        logger.exception("Audit chain status check failed")
+
+    try:
+        rows = banking_db.execute_query("SELECT customer_id FROM customers LIMIT 100")
+        logger.info("Banking DB - LOADED (%d customers)", len(rows))
+    except Exception:
+        logger.exception("Banking DB status check failed")
+
+    logger.info("Aegis Firewall ready")
+
+    yield
+
+    # ── Shutdown ──
+    pass
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.post("/api/v1/chat", response_model=ChatResponse)
+def chat(payload: ChatRequest) -> ChatResponse:
+    logger.info("[chat] session=%s prompt=%s", payload.session_id, payload.message)
+    if not payload.message.strip():
+        return ChatResponse(
+            trace_id="none",
+            verdict="CLEAN",
+            response="Please enter a valid banking query.",
+            answer="Please enter a valid banking query.",
+            was_blocked=False,
+            threat_type="none",
+            layer_used="HEURISTIC",
+            confidence=0.0,
+            encrypted_fields=[],
+            redactions=[],
+        )
+    ingress = interceptor.ingress(payload.message, payload.session_id)
+    logger.info("[ingress] trace=%s verdict=%s", ingress["trace_id"], ingress["verdict"])
+    if ingress["verdict"] == "BLOCKED":
+        logger.warning("[blocked] trace=%s threat=%s", ingress["trace_id"], ingress["threat_type"])
+        blocked_resp = llm_agent.handle_blocked(
+            trace_id=ingress["trace_id"],
+            threat_type=ingress["threat_type"],
+            session_id=payload.session_id,
+        )
+        return ChatResponse(
+            trace_id=ingress["trace_id"],
+            verdict="BLOCKED",
+            response=blocked_resp.answer,
+            answer=blocked_resp.answer,
+            was_blocked=True,
+            threat_type=ingress["threat_type"],
+            layer_used=ingress.get("layer_used", "HEURISTIC"),
+            confidence=float(ingress.get("confidence", 0.0)),
+            encrypted_fields=[],
+            redactions=[],
+        )
+
+    result = ma.plan_and_execute(ingress["sanitized_prompt"])
+    if not result.success:
+        logger.warning("[db] trace=%s error=%s", ingress["trace_id"], result.error)
+        raw_db = []
+    else:
+        raw_db = result.raw_data
+    logger.info("[db] trace=%s rows=%d", ingress["trace_id"], len(raw_db))
+    agent_resp = llm_agent.synthesize(
+        user_prompt=payload.message,
+        sanitised_data=raw_db,
+        trace_id=ingress["trace_id"],
+        session_id=payload.session_id,
+    )
+    egress = interceptor.egress(ingress["trace_id"], payload.session_id, agent_resp.answer)
+    logger.info("[egress] trace=%s verdict=%s redactions=%s", ingress["trace_id"], egress["verdict"], egress["redactions"])
+
+    return ChatResponse(
+        trace_id=ingress["trace_id"],
+        verdict=egress["verdict"],
+        response=egress["sanitized_payload"],
+        answer=egress["sanitized_payload"],
+        was_blocked=False,
+        threat_type="none",
+        layer_used=ingress.get("layer_used", "HEURISTIC"),
+        confidence=float(ingress.get("confidence", 0.0)),
+        encrypted_fields=egress.get("encrypted_fields", []),
+        redactions=egress["redactions"],
+    )
+
+
+@app.post("/api/v1/agents/link", response_model=AgentLinkResponse)
+def link_agents(payload: AgentLinkRequest) -> AgentLinkResponse:
+    """Explicitly chain Firewall ingress -> ManagingAgent -> LLMAgent -> Firewall egress."""
+    if not payload.message.strip():
+        return AgentLinkResponse(
+            trace_id="none",
+            session_id=payload.session_id,
+            verdict="CLEAN",
+            was_blocked=False,
+            threat_type="none",
+            layer_used="HEURISTIC",
+            confidence=0.0,
+            sql_executed="N/A - empty input",
+            row_count=0,
+            success=False,
+            error="Please enter a valid banking query.",
+            answer="Please enter a valid banking query.",
+            encrypted_fields=[],
+            redactions=[],
+        )
+
+    ingress = interceptor.ingress(payload.message, payload.session_id)
+    logger.info("[agents/link][ingress] trace=%s verdict=%s", ingress["trace_id"], ingress["verdict"])
+
+    if ingress["verdict"] == "BLOCKED":
+        blocked_resp = llm_agent.handle_blocked(
+            trace_id=ingress["trace_id"],
+            threat_type=ingress["threat_type"],
+            session_id=payload.session_id,
+        )
+        return AgentLinkResponse(
+            trace_id=ingress["trace_id"],
+            session_id=payload.session_id,
+            verdict="BLOCKED",
+            was_blocked=True,
+            threat_type=ingress["threat_type"],
+            layer_used=ingress.get("layer_used", "HEURISTIC"),
+            confidence=float(ingress.get("confidence", 0.0)),
+            sql_executed="N/A - blocked by ingress firewall",
+            row_count=0,
+            success=False,
+            error="Blocked by firewall ingress.",
+            answer=blocked_resp.answer,
+            encrypted_fields=[],
+            redactions=[],
+        )
+
+    result: QueryResult = ma.plan_and_execute(ingress["sanitized_prompt"])
+    rows = result.raw_data if result.success else []
+
+    llm_response = llm_agent.synthesize(
+        user_prompt=payload.message,
+        sanitised_data=rows,
+        trace_id=ingress["trace_id"],
+        session_id=payload.session_id,
+    )
+    egress = interceptor.egress(ingress["trace_id"], payload.session_id, llm_response.answer)
+    logger.info(
+        "[agents/link][egress] trace=%s verdict=%s redactions=%s",
+        ingress["trace_id"],
+        egress["verdict"],
+        egress["redactions"],
+    )
+
+    return AgentLinkResponse(
+        trace_id=ingress["trace_id"],
+        session_id=payload.session_id,
+        verdict=egress["verdict"],
+        was_blocked=False,
+        threat_type="none",
+        layer_used=ingress.get("layer_used", "HEURISTIC"),
+        confidence=float(ingress.get("confidence", 0.0)),
+        sql_executed=result.sql_executed,
+        row_count=result.row_count,
+        success=result.success,
+        error=result.error,
+        answer=egress["sanitized_payload"],
+        encrypted_fields=egress.get("encrypted_fields", []),
+        redactions=egress["redactions"],
+    )
+
+
+@app.post("/api/v1/firewall/ingress", response_model=FirewallIngressResponse)
+def ingress(payload: FirewallIngressRequest) -> FirewallIngressResponse:
+    result = interceptor.ingress(payload.prompt, payload.session_id)
+    return FirewallIngressResponse(**result)
+
+
+@app.post("/api/v1/firewall/egress", response_model=FirewallEgressResponse)
+def egress(payload: FirewallEgressRequest) -> FirewallEgressResponse:
+    result = interceptor.egress(payload.trace_id, payload.session_id, str(payload.payload))
+    return FirewallEgressResponse(**result)
+
+
+@app.get("/api/v1/audit/ledger")
+def ledger() -> list[dict]:
+    return audit_chain.get_all()
+
+
+@app.get("/api/v1/audit/verify/{trace_id}")
+def verify(trace_id: str) -> dict:
+    result = audit_chain.verify(trace_id)
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+    return result
+
+
+@app.get("/api/v1/audit/stats")
+def audit_stats() -> dict:
+    stats = audit_chain.stats()
+    stats["storage"] = "local-blockchain"
+    return stats
+
+
+@app.get("/api/v1/audit/verify_all")
+def verify_all() -> dict:
+    return audit_chain.verify_all()
+
+
+@app.get("/health", response_model=HealthResponse)
+def health() -> HealthResponse:
+    try:
+        db_rows = banking_db.execute_query("SELECT customer_id FROM customers LIMIT 1")
+        banking_db_status = "ready" if isinstance(db_rows, list) else "error"
+    except Exception:
+        banking_db_status = "error"
+
+    return HealthResponse(
+        status="ok",
+        sentinel_loaded=sentinel_loaded,
+        redactor_loaded=redactor_loaded,
+        sentinel={
+            "layer_a": bool(getattr(sentinel, "layer_a_loaded", False)),
+            "layer_b": bool(getattr(sentinel, "layer_b_loaded", False)),
+            "status": "loaded" if sentinel_loaded else "degraded",
+        },
+        redactor="loaded" if redactor_loaded else "degraded",
+        banking_db=banking_db_status,
+        llm_agent="ready" if llm_agent is not None else "error",
+        audit_chain=audit_chain.connectivity(),
+    )
+
+
+app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
